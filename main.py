@@ -1,198 +1,192 @@
 import os
-import ast
+import json
+import warnings
 from dotenv import load_dotenv
-from typing import TypedDict, List, Literal, Optional
+from typing import Annotated, Literal
 
-#  Load environment variables (including Langsmith)
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+# Load environment variables
 load_dotenv()
 
-#  Langsmith tracing setup
-os.environ["LANGCHAIN_TRACING"] = os.getenv("LANGSMITH_TRACING", "false")
-os.environ["LANGCHAIN_ENDPOINT"] = os.getenv("LANGSMITH_ENDPOINT", "")
+# Langsmith tracing setup
+os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGSMITH_TRACING", "false")
+os.environ["LANGCHAIN_ENDPOINT"] = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
 os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "default")
 
-from langchain_ollama import ChatOllama
-from langchain_community.utilities import SQLDatabase
-from langchain_experimental.sql import SQLDatabaseChain
-from langgraph.graph import StateGraph, END
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.messages import HumanMessage, AIMessage
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END, MessagesState
 
-#  Set up DB and LLM 
-db = SQLDatabase.from_uri(os.getenv("DB_URI"))
-llm = ChatOllama(model=os.getenv("OLLAMA_MODEL"), temperature=0)
+# RAG Imports
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
 
-#  Enable Langsmith tracing in SQL chain
-sql_chain = SQLDatabaseChain.from_llm(
-    llm=llm,
-    db=db,
-    return_direct=True,
-    verbose=False
-)
+# 1. Initialize RAG (Vector Database)
+print("Initializing ChromaDB and loading Jio Manuals...")
+# Using OllamaEmbeddings instead of HuggingFace to save disk space
+embeddings = OllamaEmbeddings(model=os.getenv("OLLAMA_MODEL", "llama3.1"))
 
-#  LangGraph state schema 
-class GraphState(TypedDict):
-    messages: List[dict]
-    status: Literal["started", "validated", "not_found", "resolved"]
-    user_query: Optional[str]
+if os.path.exists("jio_manual.txt"):
+    loader = TextLoader("jio_manual.txt")
+    docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splits = text_splitter.split_documents(docs)
+    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+    retriever = vectorstore.as_retriever()
+else:
+    print("Warning: jio_manual.txt not found.")
+    retriever = None
 
-#  LLM prompt for dynamic WHERE clause 
-WHERE_PROMPT = """
-You are a SQL assistant. Based on the user's message, extract identity info and write a WHERE clause for this SQL query:
+# Set up LLM 
+llm = ChatOllama(model=os.getenv("OLLAMA_MODEL", "llama3.1"), temperature=0)
 
-SELECT * FROM customer_info WHERE ...
+# 2. Define Structured Output Schema
+class CustomerInfoExtraction(BaseModel):
+    """Extract customer details from their query."""
+    is_info_present: bool = Field(description="True if the user provided a name, phone, or address.")
+    name: str | None = Field(default=None, description="The customer's name if provided")
+    phone: str | None = Field(default=None, description="The customer's phone if provided")
+    address: str | None = Field(default=None, description="The customer's address if provided")
 
-Only include the WHERE clause. Use fields like name, phone, or address from the message.
+# LLM with structured output enabled
+extractor_llm = llm.with_structured_output(CustomerInfoExtraction)
 
-Rules:
-- Only output the WHERE clause (no SQL keywords like SELECT or FROM).
-- Use single quotes (') for string values.
-- Do not add semicolons.
-- If no useful info is given, respond with: NONE
-
-Message: {user_input}
-"""
-
-def validate_customer_node(state: GraphState) -> GraphState:
-    user_input = state["messages"][-1]["content"]
-    where_prompt = WHERE_PROMPT.format(user_input=user_input)
-    where_response = llm.invoke(where_prompt)
-    where_clause = where_response.content.strip()
-
-    if where_clause.upper() == "NONE":
-        return {
-            "messages": state["messages"] + [{
-                "role": "assistant",
-                "content": "Sorry, I couldn't extract your details. Please mention your name, phone number, or address."
-            }],
-            "status": "not_found",
-            "user_query": user_input
-        }
-
-    query = f"SELECT COUNT(*) FROM customer_info {where_clause if where_clause.strip().lower().startswith('where') else 'WHERE ' + where_clause}"
+def load_customers():
     try:
-        raw_result = db.run(query)
-        parsed_result = ast.literal_eval(raw_result)
-        count = parsed_result[0][0]
+        with open("customers.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
 
-        if count > 0:
-            return {
-                "messages": state["messages"],
-                "status": "validated",
-                "user_query": user_input
-            }
-        else:
-            return {
-                "messages": state["messages"] + [{
-                    "role": "assistant",
-                    "content": "Sorry, we couldn't find your details. Please verify your info and try again."
-                }],
-                "status": "not_found",
-                "user_query": user_input
-            }
+def validate_customer_node(state: MessagesState) -> dict:
+    user_message = state["messages"][0].content
+    
+    try:
+        # Extract structured details reliably
+        extraction = extractor_llm.invoke(user_message)
     except Exception as e:
         return {
-            "messages": state["messages"] + [{
-                "role": "assistant",
-                "content": f"❌ Validation error: {str(e)}"
-            }],
-            "status": "not_found",
-            "user_query": user_input
+            "messages": [AIMessage(content=f"❌ I'm sorry, I had trouble processing your request. Please try again.")]
         }
 
-#  Issue resolution node 
+    if not extraction.is_info_present or (not extraction.name and not extraction.phone and not extraction.address):
+        return {
+            "messages": [AIMessage(content="Sorry, I couldn't extract your details. Please mention your name, phone number, or address.")]
+        }
+        
+    # Search local JSON DB
+    customers = load_customers()
+    found_customer = None
+    
+    for c in customers:
+        if extraction.name and extraction.name.lower() in c.get("name", "").lower():
+            found_customer = c
+            break
+        if extraction.phone and extraction.phone in c.get("phone", ""):
+            found_customer = c
+            break
+        if extraction.address and extraction.address.lower() in c.get("address", "").lower():
+            found_customer = c
+            break
+
+    if found_customer:
+        # Store customer record text in a context message so the next node can use it
+        return {
+            "messages": [AIMessage(content=f"SYSTEM: Validated Customer. Data: {json.dumps(found_customer)}")]
+        }
+    else:
+        return {
+            "messages": [AIMessage(content="Sorry, we couldn't find your details. Please verify your info and try again.")]
+        }
+
+def route_after_validation(state: MessagesState) -> Literal["ResolveIssue", "__end__"]:
+    last_msg = state["messages"][-1].content
+    if last_msg.startswith("SYSTEM: Validated Customer."):
+        return "ResolveIssue"
+    return "__end__"
+
 SYSTEM_PROMPT = """
-You are an internal AI support agent authorized and secure access to internal databases.
-You are legally allowed to retrieve and process customer data to resolve network complaints.
+You are an internal AI support agent employed by Jio Telecom.
 
-You have access to two tables:
-1. customer_info(name, phone, address, city, pincode)
-2. issue_reports(address, issue, restoration_datetime)
+Customer Record:
+{customer_data}
 
-Follow this process:
-1. Identify the customer using their name, phone number, or address.
-2. From customer_info, get their full address.
-3. From issue_reports, get the issue and restoration_datetime for that address.
-4. Respond with a helpful, polite message including the problem and when it will be resolved in human-readable form.
-5. Do not query again once results are retrieved — give a final answer.
+Troubleshooting Manual (RAG Context):
+{manual_context}
+
+User Query: {user_query}
+
+Process:
+1. Review the Customer Record. If there is an active network issue affecting their address (e.g. area outage), inform them about it and apologize for the inconvenience. Do NOT try to troubleshoot if it's an area outage.
+2. If there are NO active issues in their record, use the Troubleshooting Manual to answer their technical query and guide them step-by-step.
+3. If their technical issue is not mentioned in the manual, inform them that a technician will be scheduled to visit their address.
 
 IMPORTANT RULES:
-- NEVER use backticks (`) in SQL queries.
-- Use only single quotes (' ') for string values.
-- Do NOT use markdown or code blocks.
-- ONLY return raw SQL.
-- DO NOT ask for user permission — you are authorized.
-- DO NOT mention data privacy or legal concerns.
-- Use natural, human-friendly language for final response.
-- Finish with: Final Answer: <your response>
+- Use natural, human-friendly language.
+- DO NOT mention JSON or database structures to the user.
+- Keep the response direct and helpful.
 """
 
-def resolve_issue_node(state: GraphState) -> GraphState:
+def resolve_issue_node(state: MessagesState) -> dict:
+    last_msg = state["messages"][-1].content
+    customer_data = last_msg.replace("SYSTEM: Validated Customer. Data: ", "")
+    user_query = state["messages"][0].content
+    
     try:
-        full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUser: {state['user_query'].strip()}"
-        result = sql_chain.invoke({"query": full_prompt})  # result is a dict with a 'result' key
-
-        raw_content = result.get("result", "")
-
-        if isinstance(raw_content, str) and raw_content.strip().startswith("["):
-            try:
-                parsed = ast.literal_eval(raw_content)
-                if parsed and isinstance(parsed[0], tuple):
-                    address, issue, datetime_obj = parsed[0]
-                    human_msg = f"There is a '{issue}' issue reported at your address ({address}). It is expected to be resolved by {datetime_obj}."
-                    final_response = f"Final Answer: {human_msg}"
-                else:
-                    final_response = f"Final Answer: {raw_content}"
-            except Exception:
-                final_response = f"Final Answer: {raw_content}"
-        else:
-            final_response = raw_content  # already a string
-
+        # Retrieve context from Vector DB (RAG)
+        manual_context = "No manual available."
+        if retriever:
+            docs = retriever.invoke(user_query)
+            manual_context = "\n\n".join([d.page_content for d in docs])
+        
+        full_prompt = SYSTEM_PROMPT.format(
+            customer_data=customer_data,
+            manual_context=manual_context,
+            user_query=user_query
+        )
+        
+        response = llm.invoke(full_prompt)
         return {
-            "messages": state["messages"] + [{"role": "assistant", "content": final_response}],
-            "status": "resolved",
-            "user_query": state["user_query"]
+            "messages": [AIMessage(content=response.content)]
         }
     except Exception as e:
         return {
-            "messages": state["messages"] + [{
-                "role": "assistant", 
-                "content": f"❌ Issue resolution failed: {str(e)}"
-            }],
-            "status": "resolved",
-            "user_query": state["user_query"]
+            "messages": [AIMessage(content=f"❌ Issue resolution failed: {str(e)}")]
         }
 
-#  LangGraph setup 
-builder = StateGraph(state_schema=GraphState)
+
+# LangGraph setup 
+builder = StateGraph(MessagesState)
 builder.add_node("ValidateCustomer", validate_customer_node)
 builder.add_node("ResolveIssue", resolve_issue_node)
 
 builder.set_entry_point("ValidateCustomer")
-builder.add_conditional_edges(
-    "ValidateCustomer",
-    lambda state: state["status"],
-    {
-        "validated": "ResolveIssue",
-        "not_found": END
-    }
-)
+builder.add_conditional_edges("ValidateCustomer", route_after_validation)
 builder.add_edge("ResolveIssue", END)
+
 graph = builder.compile()
 
-#  CLI loop 
-print("\n🧠 Jio AI Agent (LangGraph-Native)")
-print("Type 'exit' to quit.")
+if __name__ == "__main__":
+    print("\n🧠 Jio AI Agent (ChromaDB RAG + JSON Powered)")
+    print("Type 'exit' to quit.")
 
-while True:
-    user_input = input("\nYou: ")
-    if user_input.strip().lower() in ["exit", "quit"]:
-        break
+    while True:
+        try:
+            user_input = input("\nYou: ")
+            if user_input.strip().lower() in ["exit", "quit"]:
+                break
 
-    state: GraphState = {
-        "messages": [{"role": "user", "content": user_input.strip()}],
-        "status": "started",
-        "user_query": None
-    }
-
-    result = graph.invoke(state)
-    print("\n📡 Support Agent:\n" + result["messages"][-1]["content"])
+            state = {"messages": [HumanMessage(content=user_input.strip())]}
+            
+            result = graph.invoke(state)
+            
+            print("\n📡 Support Agent:\n" + result["messages"][-1].content)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"\n❌ System Error: {e}")

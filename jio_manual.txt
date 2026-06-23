@@ -1,0 +1,17 @@
+JioFiber Troubleshooting Manual:
+
+Issue 1: Red Blinking PON Light
+- Cause: The optical fiber cable is disconnected or broken.
+- Solution: Check the green connector at the back of your router. Ensure it is firmly pushed in until it clicks. If the cable is physically broken, contact support to schedule a fiber replacement.
+
+Issue 2: Solid Red LOS Light
+- Cause: Loss of signal from the local distribution box.
+- Solution: This usually indicates an area outage or a cut in the main line outside your house. Please check if your neighbors are also affected and wait for our technical team to resolve the area outage.
+
+Issue 3: Slow WiFi Speeds
+- Cause: Router placement, 2.4GHz interference, or device issues.
+- Solution: Make sure you are connected to the 5GHz Wi-Fi band for maximum speeds. Move your router to an open space, away from thick walls or microwaves. Restart the router by unplugging it for 30 seconds and plugging it back in.
+
+Issue 4: No Internet but WiFi is Connected
+- Cause: IP allocation failure or backend sync issue.
+- Solution: First, try restarting the router. If that doesn't work, perform a hard reset by pressing the reset button on the back of the router with a pin for 10 seconds. You may need to wait 5 minutes for it to automatically re-configure.

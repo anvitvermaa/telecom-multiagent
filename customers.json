@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Anvit Verma",
+    "phone": "9876543210",
+    "address": "123 Tech Park, Mumbai",
+    "active_issues": ["No active issues reported."]
+  },
+  {
+    "name": "John Doe",
+    "phone": "8765432109",
+    "address": "456 Bandra West, Mumbai",
+    "active_issues": ["Area-wide fiber cut. Expected restoration by 8 PM tonight."]
+  },
+  {
+    "name": "Jane Smith",
+    "phone": "7654321098",
+    "address": "789 Andheri East, Mumbai",
+    "active_issues": ["Slow speeds reported. Technician scheduled for tomorrow 10 AM."]
+  }
+]
